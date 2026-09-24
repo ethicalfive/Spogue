@@ -1,0 +1,642 @@
+import express from 'express';
+import path from 'path';
+import { createServer } from 'http';
+import { Server, Socket } from 'socket.io';
+import { AnimalEntity } from './src/game/entities/AnimalEntity';
+import { PlayerEntity } from './src/game/entities/PlayerEntity';
+import { AISystem } from './src/game/systems/AISystem';
+import { WorldRecipes } from './src/game/worldbuilding/Recipes';
+import { MapGenerator, TileType } from './src/game/MapGenerator';
+import { BoatData, ItemData, ItemSlot } from './src/game/Entities';
+import { LootSystem } from './src/game/data/LootTables';
+import { BiomeSystem, BiomeData } from './src/game/data/BiomeData';
+import { EntityDatabase } from './src/game/data/EntityData';
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+  
+  const httpServer = createServer(app);
+  const io = new Server(httpServer, {
+    cors: {
+      origin: '*', // Allow all origins for dev
+      methods: ['GET', 'POST']
+    }
+  });
+
+  // Map Generator
+  const mapGen = new MapGenerator('default_seed');
+
+
+
+  // Generate a procedural dungeon at a fixed offset
+  let dungeonStartX = 10000;
+  let dungeonStartY = 10000;
+  
+  const generateDungeon = () => {
+     let currentX = dungeonStartX;
+     let currentY = dungeonStartY;
+     
+     // Boss room at the end
+     let rooms = Math.floor(Math.random() * 8) + 3; // 3 to 10 rooms
+     
+     for (let r = 0; r < rooms; r++) {
+        // Room size
+        let w = Math.floor(Math.random() * 4) + 4; // 4 to 7
+        let h = Math.floor(Math.random() * 4) + 4; // 4 to 7
+        
+        for (let ix = -1; ix <= w; ix++) {
+           for (let iy = -1; iy <= h; iy++) {
+              if (ix === -1 || ix === w || iy === -1 || iy === h) {
+                  mapGen.setTileAt(currentX + ix, currentY + iy, TileType.CAVE_WALL);
+              } else {
+                  mapGen.setTileAt(currentX + ix, currentY + iy, TileType.CAVE_FLOOR);
+              }
+           }
+        }
+        
+        // Next room corridor
+        let nextDir = Math.floor(Math.random() * 4); // 0 up, 1 right, 2 down, 3 left
+        // Add corridor tiles... simplistic path
+        // For simplicity, let's just make rooms in a line for now, or simple branching
+        // If r is boss room (last room), spawn boss
+        if (r === rooms - 1) {
+            mapGen.setTileAt(currentX + Math.floor(w/2), currentY + Math.floor(h/2), TileType.CAVE_FLOOR); // Boss spot
+            
+            // Spawn Boss
+            const bossId = `animal_${nextAnimalId++}`;
+            const boss = new AnimalEntity(bossId, (currentX + Math.floor(w/2)) * mapGen.tileSize, (currentY + Math.floor(h/2)) * mapGen.tileSize, 'necromancer');
+            boss.name = "The Undying Lord";
+            boss.level = 10;
+            boss.health.max = 1000;
+            boss.health.current = 1000;
+            animals[bossId] = boss;
+        } else {
+            // Corridor
+            let corrLength = Math.floor(Math.random() * 3) + 3;
+            for (let c = 0; c < corrLength; c++) {
+               mapGen.setTileAt(currentX + w + c, currentY + Math.floor(h/2), TileType.CAVE_FLOOR);
+               mapGen.setTileAt(currentX + w + c, currentY + Math.floor(h/2) - 1, TileType.CAVE_WALL);
+               mapGen.setTileAt(currentX + w + c, currentY + Math.floor(h/2) + 1, TileType.CAVE_WALL);
+            }
+            currentX += w + corrLength;
+        }
+     }
+     
+     // Entrance Room -> Teleporter back
+     mapGen.setTileAt(dungeonStartX - 1, dungeonStartY + 2, TileType.DUNGEON_ENTRANCE);
+     
+     // Place an entrance near player start (0,0)
+     // Let's find a safe spot near 0,0 and put the DUNGEON_ENTRANCE there
+     let placed = false;
+     for (let ix = -10; ix <= 10; ix++) {
+        for (let iy = -10; iy <= 10; iy++) {
+           if (!placed && mapGen.getTileAt(ix, iy) === TileType.MOUNTAIN) {
+               mapGen.setTileAt(ix, iy, TileType.DUNGEON_ENTRANCE);
+               placed = true;
+           }
+        }
+     }
+     if (!placed) {
+         mapGen.setTileAt(5, 5, TileType.DUNGEON_ENTRANCE); // fallback
+     }
+  };
+  // Game State
+  const players: Record<string, PlayerEntity> = {};
+  const animals: Record<string, AnimalEntity> = {};
+  const boats: Record<string, BoatData> = {};
+  const items: Record<string, ItemData> = {};
+
+  let nextItemId = 0;
+  let nextAnimalId = 0;
+
+  generateDungeon();
+
+  const generateDrop = (animalType: string, x: number, y: number, isRoyalSource?: boolean) => {
+      const item = LootSystem.generateDrop(animalType, x, y, () => `item_${nextItemId++}`, isRoyalSource);
+      if (item) {
+          items[item.id] = item;
+          io.emit('itemDropped', item);
+      }
+  };
+
+  const getSafeSpawn = (type: string, isPlayer = false, nearX = 0, nearY = 0) => {
+     let x = 0, y = 0;
+     let isAquatic = false;
+     let allowedTiles: TileType[] | null = null;
+     
+     if (!isPlayer) {
+         const def = EntityDatabase[type];
+         if (def) {
+             isAquatic = def.isAquatic;
+             for (const b of Object.values(BiomeData)) {
+                 for (const spawner of b.spawners) {
+                     if (spawner.type === type) {
+                         allowedTiles = spawner.allowedTiles;
+                         break;
+                     }
+                 }
+                 if (allowedTiles) break;
+             }
+         }
+     }
+
+     for (let i = 0; i < 200; i++) {
+        x = nearX + (Math.random() * 2000 - 1000);
+        y = nearY + (Math.random() * 2000 - 1000);
+        const tX = Math.floor(x / mapGen.tileSize);
+        const tY = Math.floor(y / mapGen.tileSize);
+        const tile = mapGen.getTileAt(tX, tY);
+        
+        if (isPlayer) {
+            if (tile === TileType.GRASS || tile === TileType.SAND || tile === TileType.FOREST || tile === TileType.MAGIC_FOREST || tile === TileType.OASIS) return {x, y};
+        } else {
+            if (allowedTiles && allowedTiles.includes(tile)) {
+                return {x, y};
+            } else if (!allowedTiles) {
+                if (isAquatic && tile === TileType.WATER) return {x, y};
+                if (!isAquatic && tile !== TileType.WATER && tile !== TileType.MOUNTAIN && tile !== TileType.GLACIER && tile !== TileType.DUNE) return {x, y};
+            }
+        }
+     }
+     
+     for (let tx = -20; tx < 20; tx++) {
+        for (let ty = -20; ty < 20; ty++) {
+           const cx = nearX / mapGen.tileSize + tx;
+           const cy = nearY / mapGen.tileSize + ty;
+           const tile = mapGen.getTileAt(Math.floor(cx), Math.floor(cy));
+           let valid = false;
+           if (isPlayer) {
+               valid = tile === TileType.GRASS || tile === TileType.SAND || tile === TileType.FOREST || tile === TileType.MAGIC_FOREST || tile === TileType.OASIS;
+           } else {
+               if (allowedTiles && allowedTiles.includes(tile)) valid = true;
+               else if (!allowedTiles && isAquatic && tile === TileType.WATER) valid = true;
+               else if (!allowedTiles && !isAquatic && tile !== TileType.WATER && tile !== TileType.MOUNTAIN && tile !== TileType.GLACIER && tile !== TileType.DUNE) valid = true;
+           }
+           if (valid) {
+               return {x: Math.floor(cx) * mapGen.tileSize + mapGen.tileSize/2, y: Math.floor(cy) * mapGen.tileSize + mapGen.tileSize/2};
+           }
+        }
+     }
+     return {x: nearX, y: nearY};
+  };
+
+  const spawnAnimalNearPlayers = () => {
+     const playerIds = Object.keys(players);
+     if (playerIds.length === 0) return;
+     
+     const pId = playerIds[Math.floor(Math.random() * playerIds.length)];
+     const p = players[pId];
+     
+     let x = p.transform.x + (Math.random() * 2000 - 1000);
+     let y = p.transform.y + (Math.random() * 2000 - 1000);
+     
+     if (Math.hypot(x - p.transform.x, y - p.transform.y) < 500) return;
+
+     const tX = Math.floor(x / mapGen.tileSize);
+     const tY = Math.floor(y / mapGen.tileSize);
+     const tile = mapGen.getTileAt(tX, tY);
+
+     const biome = BiomeSystem.getBiomeForTile(tile);
+     if (!biome || biome.spawners.length === 0) return;
+
+     // Randomly pick a spawner based on chance
+     const spawner = biome.spawners[Math.floor(Math.random() * biome.spawners.length)];
+     if (Math.random() > spawner.spawnChance) return;
+     
+     if (!spawner.allowedTiles.includes(tile)) return;
+
+     // Check limit
+     let count = 0;
+     for (const id in animals) {
+         if (animals[id].type === spawner.type) count++;
+     }
+     if (count >= spawner.maxCount) return;
+
+     const id = `animal_${nextAnimalId++}`;
+     const animal = new AnimalEntity(id, x, y, spawner.type);
+     animals[id] = animal;
+     io.emit('animalSpawned', animal.toJSON());
+  };
+
+  // Spawn initial boats
+  for (let i = 0; i < 3; i++) {
+    let x = 0, y = 0;
+    for (let attempts = 0; attempts < 500; attempts++) {
+       x = Math.random() * 4000 - 2000; // Search wider
+       y = Math.random() * 4000 - 2000;
+       const tX = Math.floor(x / mapGen.tileSize);
+       const tY = Math.floor(y / mapGen.tileSize);
+       if (mapGen.getTileAt(tX, tY) === TileType.WATER) {
+          boats[`boat_${i}`] = { id: `boat_${i}`, x, y };
+          break;
+       }
+    }
+  }
+
+  let lastTime = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+    
+    const playerIds = Object.keys(players);
+    if (playerIds.length > 0) {
+        for (const id in animals) {
+            const a = animals[id];
+            let isNearAnyPlayer = false;
+            for (const pid of playerIds) {
+               const p = players[pid];
+               if (Math.hypot(a.transform.x - p.transform.x, a.transform.y - p.transform.y) < 2500) {
+                   isNearAnyPlayer = true;
+                   break;
+               }
+            }
+            if (!isNearAnyPlayer) {
+               delete animals[id];
+            }
+        }
+        
+        let spawnAttempts = 0;
+        while (Object.keys(animals).length < 50 && spawnAttempts < 25) {
+            spawnAnimalNearPlayers();
+            spawnAttempts++;
+        }
+    }
+
+    AISystem.update(animals, players, mapGen, io, getSafeSpawn, items);
+    
+    // Check for alpha dog evolution
+    for (const pid in players) {
+        let dogsOwned = [];
+        let alphaExists = false;
+        for (const aid in animals) {
+            if (animals[aid].ownerId === pid) {
+                if (animals[aid].type === 'dog') dogsOwned.push(animals[aid]);
+                if (animals[aid].type === 'alpha_dog') alphaExists = true;
+            }
+        }
+        if (!alphaExists && dogsOwned.length >= 2) {
+            // Evolve the first dog
+            dogsOwned[0].evolveTo('alpha_dog');
+            dogsOwned[0].name = "Alpha";
+            dogsOwned[0].health.max = 300;
+            dogsOwned[0].health.current = 300;
+            io.emit('animalEvolved', { id: dogsOwned[0].id, newType: 'alpha_dog' });
+        }
+    }
+
+    for (const id in animals) {
+       animals[id].update(dt, null);
+    }
+    
+    const playersJSON: any = {};
+    for (const id in players) playersJSON[id] = players[id].toJSON();
+    const animalsJSON: any = {};
+    for (const id in animals) animalsJSON[id] = animals[id].toJSON();
+
+    io.volatile.emit('gameState', { players: playersJSON, animals: animalsJSON, boats, items });
+  }, 1000 / 30); // 30 FPS tick
+
+  io.on('connection', (socket: Socket) => {
+    console.log(`Player connected: ${socket.id}`);
+    
+    players[socket.id] = WorldRecipes.spawnPlayer(
+      socket.id,
+      `hsl(${Math.random() * 360}, 70%, 50%)`
+    );
+
+    const startLoc = getSafeSpawn('player', true, 0, 0);
+    players[socket.id].transform.x = startLoc.x;
+    players[socket.id].transform.y = startLoc.y;
+
+    const playersJSON: any = {};
+    for (const id in players) playersJSON[id] = players[id].toJSON();
+    const animalsJSON: any = {};
+    for (const id in animals) animalsJSON[id] = animals[id].toJSON();
+    
+    socket.emit('init', { id: socket.id, players: playersJSON, animals: animalsJSON, boats, items, mapEdits: mapGen.getModifiedTiles() });
+    socket.broadcast.emit('playerJoined', players[socket.id].toJSON());
+
+    socket.on('move', (pos: {x: number, y: number}) => {
+      if (players[socket.id] && players[socket.id].isAlive) {
+        const p = players[socket.id];
+        const checkCollision = (cx: number, cy: number) => {
+           for (const pt of [{x: cx - 8, y: cy - 8}, {x: cx + 8, y: cy - 8}, {x: cx - 8, y: cy + 8}, {x: cx + 8, y: cy + 8}]) {
+              const tile = mapGen.getTileAt(Math.floor(pt.x / mapGen.tileSize), Math.floor(pt.y / mapGen.tileSize));
+              if (tile === TileType.MOUNTAIN || tile === TileType.GLACIER || tile === TileType.DUNE) return true;
+              if (tile === TileType.WATER && !p.isRidingBoat) return true;
+              if (tile !== TileType.WATER && p.isRidingBoat) return true;
+           }
+           return false;
+        };
+        
+        if (!checkCollision(pos.x, pos.y)) {
+           p.transform.x = pos.x;
+           p.transform.y = pos.y;
+           
+           if (p.isRidingBoat) {
+              const tX = Math.floor(pos.x / mapGen.tileSize);
+              const tY = Math.floor(pos.y / mapGen.tileSize);
+              if (mapGen.getTileAt(tX, tY) === TileType.WATER) {
+                  // Keep boat under player
+              } else {
+                  // Wait, collision handles this
+              }
+           }
+        }
+      }
+    });
+
+    socket.on('editMap', (data: {x: number, y: number, type: TileType}) => {
+       mapGen.setTileAt(data.x, data.y, data.type);
+       io.emit('mapEdited', data);
+    });
+
+    socket.on('pickupItem', (itemId: string) => {
+       const p = players[socket.id];
+       if (!p || !p.isAlive) return;
+       const item = items[itemId];
+       if (item && item.x !== undefined && item.y !== undefined) {
+           const dist = Math.hypot(item.x - p.transform.x, item.y - p.transform.y);
+           if (dist < 80) {
+               p.inventory.push(item);
+               delete items[itemId];
+           }
+       }
+    });
+
+
+    socket.on('processItem', (itemId: string) => {
+       const p = players[socket.id];
+       if (!p || !p.isAlive) return;
+       const item = items[itemId];
+       if (item && item.type === 'corpse') {
+           const dist = Math.hypot(item.x - p.transform.x, item.y - p.transform.y);
+           if (dist < 80) {
+               delete items[itemId];
+               // Generate meat
+               const meatId = `item_${nextItemId++}`;
+               const meat = {
+                   id: meatId,
+                   name: 'Fresh Meat',
+                   type: 'meat',
+                   slot: 'none',
+                   color: '#b91c1c',
+                   stats: { heal: 30 },
+                   x: p.transform.x,
+                   y: p.transform.y
+               };
+               items[meatId] = meat;
+               io.emit('itemDropped', meat);
+           }
+       }
+    });
+
+    
+    socket.on('setPackBehavior', (behavior: string) => {
+        const p = players[socket.id];
+        if (!p || !p.isAlive) return;
+        
+        // Ensure whistle is equipped
+        const hasWhistle = Object.values(p.equipment || {}).some((i: any) => i && i.type === 'whistle');
+        if (hasWhistle) {
+            p.packBehavior = behavior;
+            io.emit('stateUpdate', { players: { [socket.id]: p.toJSON() } });
+            io.emit('whistleBlown', { id: socket.id, behavior });
+        }
+    });
+
+    socket.on('useItem', (itemId: string) => {
+       const p = players[socket.id];
+       if (!p || !p.isAlive) return;
+       
+       let invIdx = p.inventory.findIndex(i => i.id === itemId);
+       let item = p.inventory[invIdx];
+       let fromGround = false;
+       
+       if (!item) {
+           item = items[itemId];
+           if (item && item.x !== undefined && item.y !== undefined) {
+               const dist = Math.hypot(item.x - p.transform.x, item.y - p.transform.y);
+               if (dist < 80) {
+                   fromGround = true;
+               } else {
+                   item = null;
+               }
+           } else {
+               item = null;
+           }
+       }
+
+       if (item) {
+           if (item.type === 'meat') {
+               p.health.heal(item.stats.heal || 30);
+               if (fromGround) {
+                   delete items[itemId];
+               } else {
+                   p.inventory.splice(invIdx, 1);
+               }
+               io.emit('stateUpdate', { players: { [socket.id]: p.toJSON() } });
+           } else if (item.type === 'whistle') {
+               // Not used to cycle anymore
+           }
+       }
+    });
+
+    socket.on('equipItem', (itemId: string) => {
+       const p = players[socket.id];
+       if (!p || !p.isAlive) return;
+       
+       let item = items[itemId];
+       if (item && item.x !== undefined && item.y !== undefined) {
+           const dist = Math.hypot(item.x - p.transform.x, item.y - p.transform.y);
+           if (dist < 80) {
+               delete items[itemId];
+               if (p.equipment[item.slot]) {
+                   p.inventory.push(p.equipment[item.slot] as any);
+               }
+               p.equipment[item.slot] = item;
+               return;
+           }
+       }
+       
+       const invIdx = p.inventory.findIndex(i => i.id === itemId);
+       if (invIdx >= 0) {
+           item = p.inventory.splice(invIdx, 1)[0];
+           if (p.equipment[item.slot]) {
+               p.inventory.push(p.equipment[item.slot] as any);
+           }
+           p.equipment[item.slot] = item;
+       }
+    });
+
+
+    socket.on('interact', () => {
+       const p = players[socket.id];
+       if (!p || !p.isAlive) return;
+       
+       const tX = Math.floor(p.transform.x / mapGen.tileSize);
+       const tY = Math.floor(p.transform.y / mapGen.tileSize);
+       
+       // Check for Dungeon Entrance
+       let onEntrance = false;
+       for (const pos of [{x: tX, y: tY}, {x: tX+1, y: tY}, {x: tX-1, y: tY}, {x: tX, y: tY+1}, {x: tX, y: tY-1}]) {
+           if (mapGen.getTileAt(pos.x, pos.y) === TileType.DUNGEON_ENTRANCE) {
+               onEntrance = true;
+               break;
+           }
+       }
+       
+       if (onEntrance) {
+           // Teleport
+           if (tX > 5000) {
+               // In dungeon, teleport back
+               const safe = getSafeSpawn('player', true, 0, 0);
+               p.transform.x = safe.x;
+               p.transform.y = safe.y;
+           } else {
+               // In overworld, teleport to dungeon
+               p.transform.x = dungeonStartX * mapGen.tileSize + mapGen.tileSize / 2;
+               p.transform.y = dungeonStartY * mapGen.tileSize + mapGen.tileSize / 2;
+           }
+           io.emit('stateUpdate', { players: Object.fromEntries(Object.entries(players).map(([id, p]) => [id, p.toJSON()])) });
+           return;
+       }
+
+       if (p.isRidingBoat) {
+
+          const tX = Math.floor(p.transform.x / mapGen.tileSize);
+          const tY = Math.floor(p.transform.y / mapGen.tileSize);
+          let safeSpot = null;
+          for (const pos of [{x: tX+1, y: tY}, {x: tX-1, y: tY}, {x: tX, y: tY+1}, {x: tX, y: tY-1}]) {
+             const cTile = mapGen.getTileAt(pos.x, pos.y); if (cTile !== TileType.WATER && cTile !== TileType.MOUNTAIN && cTile !== TileType.GLACIER && cTile !== TileType.DUNE) {
+                safeSpot = pos; break;
+             }
+          }
+          if (safeSpot) {
+             p.isRidingBoat = false;
+             boats[`boat_${Date.now()}`] = { id: `boat_${Date.now()}`, x: p.transform.x, y: p.transform.y };
+             p.transform.x = safeSpot.x * mapGen.tileSize + mapGen.tileSize/2;
+             p.transform.y = safeSpot.y * mapGen.tileSize + mapGen.tileSize/2;
+          }
+          return;
+       }
+       
+       for (const bId in boats) {
+           const b = boats[bId];
+           const dist = Math.hypot(b.x - p.transform.x, b.y - p.transform.y);
+           if (dist < 60) {
+               p.isRidingBoat = true;
+               p.transform.x = b.x;
+               p.transform.y = b.y;
+               delete boats[bId];
+               return;
+           }
+       }
+    });
+
+    socket.on('attack', (data: {targetId: string}) => {
+      const p = players[socket.id];
+      if (!p || !p.isAlive) return;
+      const damage = p.TotalDamage;
+
+      if (players[data.targetId] && players[data.targetId].isAlive) {
+         players[data.targetId].takeDamage(damage);
+         if (!players[data.targetId].isAlive) {
+            if (players[socket.id]) players[socket.id].score += 10;
+            io.emit('playerDied', { id: data.targetId, killerId: socket.id });
+            setTimeout(() => {
+               if (players[data.targetId]) {
+                 players[data.targetId].health.heal(100);
+                 players[data.targetId].isAlive = true;
+                 const loc = getSafeSpawn('player', true);
+                 players[data.targetId].transform.x = loc.x;
+                 players[data.targetId].transform.y = loc.y;
+                 io.emit('playerRespawned', players[data.targetId].toJSON());
+               }
+            }, 3000);
+         }
+      } else {
+        const animal = animals[data.targetId];
+        if (animal && animal.isAlive) {
+          // Prevent hitting tamed dogs
+          if (animal.ownerId) {
+              // Either don't let anyone hit any tamed dog, or just owner
+              // "u dont want to accidentally hit pet dogs" -> Prevent anyone from hitting it?
+              // Let's prevent owner from hitting it.
+              if (animal.ownerId === socket.id) return;
+              if (animal.type === 'dog') return; // protect all pet dogs
+          }
+          animal.takeDamage(damage);
+          if (!animal.isAlive) {
+             if (players[socket.id]) players[socket.id].score += 1;
+             
+             // Check if it was a named/royal monster
+             const isRoyal = animal.name !== undefined && animal.name.length > 0;
+             generateDrop(animal.type, animal.transform.x, animal.transform.y, isRoyal);
+             
+             setTimeout(() => {
+                if (animals[data.targetId]) {
+                   delete animals[data.targetId];
+                }
+             }, 5000); // remove corpse after 5s
+          }
+        }
+      }
+    });
+
+    socket.on('nameMonster', (data: {targetId: string, name: string}) => {
+       const p = players[socket.id];
+       if (!p || !p.isAlive) return;
+       const animal = animals[data.targetId];
+       if (!animal || !animal.isAlive) return;
+       
+       if (p.mana >= 50) {
+           p.mana -= 50;
+           animal.name = data.name;
+           if (!animal.level) animal.level = 1;
+           animal.level += 1;
+           animal.health.heal(100);
+           
+           // Notify everyone
+           io.emit('stateUpdate', {
+             players: Object.fromEntries(Object.entries(players).map(([id, p]) => [id, p.toJSON()])),
+             animals: Object.fromEntries(Object.entries(animals).map(([id, a]) => [id, a.toJSON()])),
+             items,
+             boats
+           });
+       }
+    });
+
+    socket.on('disconnect', () => {
+      console.log(`Player disconnected: ${socket.id}`);
+      delete players[socket.id];
+      io.emit('playerLeft', socket.id);
+    });
+  });
+
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', players: Object.keys(players).length });
+  });
+
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.join(process.cwd(), 'dist')));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
+    });
+  }
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch(console.error);
